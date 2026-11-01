@@ -14,7 +14,7 @@ use tycho_types::cell::{CellBuilder, HashBytes, Lazy, Load};
 use tycho_types::dict::AugDict;
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
-use tycho_types::models::{AccountState, BlockchainConfig, BlockchainConfigParams, ConfigParam34, CurrencyCollection, DepthBalanceInfo, OptionalAccount, ShardAccount, ShardAccounts, ShardStateUnsplit};
+use tycho_types::models::{AccountState, BlockchainConfig, BlockchainConfigParams, ConfigParam32, ConfigParam34, CurrencyCollection, DepthBalanceInfo, OptionalAccount, ShardAccount, ShardAccounts, ShardStateUnsplit};
 use tycho_types::num::Tokens;
 
 #[derive(Debug, Copy, Clone, Serialize)]
@@ -53,9 +53,17 @@ pub fn migrate_state(
                 total_balance = total_balance.checked_add(&validator_balance)?;
 
                 println!("Updating masterchain config...");
+                check_snapshot_between_elections(&custom.config.params, old_state.gen_utime)?;
                 override_validator_set(
                     &mut global_config.config.params,
                     current_validator_set.as_ref(),
+                    &custom.config.params,
+                )?;
+                check_first_election_fits(&global_config.config.params, time_ms)?;
+                check_previous_stakes_unfreeze_on_new_chain(
+                    &custom.config.params,
+                    old_state.gen_utime,
+                    time_ms,
                 )?;
 
                 override_workchain_zerostates(&mut global_config.config.params, shard_state_id)?;
@@ -72,16 +80,13 @@ pub fn migrate_state(
                     anyhow::bail!("failed to reset elector account");
                 }
 
+                // Preserve elector balances and staking records after validating snapshot timing.
+                // Existing validator wallets and DePool proxies retain their recovery claims.
                 let elector_address = global_config.config.get_elector_address()?;
-                if let Some((depth_balance, mut elector_account)) =
-                    shard_accounts.get(elector_address)?
-                {
-                    reset_elector_account(&mut elector_account)?;
-                    shard_accounts.set(elector_address, depth_balance, elector_account)?;
-                    println!("Elector contract was reset!");
-                } else {
-                    anyhow::bail!("failed to reset elector account");
+                if shard_accounts.get(elector_address)?.is_none() {
+                    anyhow::bail!("elector account not found");
                 }
+                println!("Elector contract kept unchanged");
 
                 println!("Serializing accounts before prev_blocks...");
                 let accounts = Lazy::new(&shard_accounts)?;
@@ -279,6 +284,7 @@ fn map_shard_hashes(
 fn override_validator_set(
     config: &mut BlockchainConfigParams,
     current_validator_set: Option<&tycho::ValidatorSet>,
+    old_config: &BlockchainConfigParams,
 ) -> Result<()> {
     if let Some(vset) = current_validator_set {
         config.remove(32)?;
@@ -287,8 +293,104 @@ fn override_validator_set(
         config.remove(36)?;
         config.remove(37)?;
         config.set::<ConfigParam34>(vset)?;
+
+        // DePools require p32: keep old p32 when p34 continues unchanged;
+        // otherwise use old p34 as the previous set.
+        let old_current = old_config.get::<ConfigParam34>()?;
+        let prev = match old_current {
+            Some(old) if same_validator_set(&old, vset) => old_config.get::<ConfigParam32>()?,
+            other => other,
+        };
+        if let Some(prev) = prev {
+            config.set::<ConfigParam32>(&prev)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Same validators over the same period. Compares what identifies a set rather than the whole struct,
+/// because a set read from JSON and one read from a cell differ in derived fields.
+fn same_validator_set(a: &tycho::ValidatorSet, b: &tycho::ValidatorSet) -> bool {
+    a.utime_since == b.utime_since
+        && a.utime_until == b.utime_until
+        && a.list.len() == b.list.len()
+        && a.list
+            .iter()
+            .zip(&b.list)
+            .all(|(x, y)| x.public_key == y.public_key && x.weight == y.weight)
+}
+
+/// Require a snapshot before elections open and without a pending p36 set.
+/// This prevents carrying an unfinished election into the new chain.
+fn check_snapshot_between_elections(old: &BlockchainConfigParams, snapshot_utime: u32) -> Result<()> {
+    anyhow::ensure!(
+        !old.contains::<tycho::ConfigParam36>()?,
+        "the snapshot has a next validator set (p36): an election has finished but its set is not \
+         installed yet. Take the snapshot after the switch and before the next elections open"
+    );
+    let vset = old
+        .get::<ConfigParam34>()?
+        .context("the old state has no current validator set (p34)")?;
+    let timings = old.get_election_timings()?;
+    let opens = vset.utime_until.saturating_sub(timings.elections_start_before);
+    anyhow::ensure!(
+        snapshot_utime < opens,
+        "the snapshot ({snapshot_utime}) is inside an election: elections for the next set open at \
+         {opens} (p34 utime_until {} - elections_start_before {}). Take the snapshot after the \
+         switch and before the next elections open",
+        vset.utime_until,
+        timings.elections_start_before
+    );
+    Ok(())
+}
+
+/// Start Tycho before pending stakes unfreeze at p34.utime_since + stake_held_for.
+/// Blocks must be produced by then to keep DePool recovery accounting aligned.
+fn check_previous_stakes_unfreeze_on_new_chain(
+    old: &BlockchainConfigParams,
+    snapshot_utime: u32,
+    time_ms: u64,
+) -> Result<()> {
+    let vset = old
+        .get::<ConfigParam34>()?
+        .context("the old state has no current validator set (p34)")?;
+    let timings = old.get_election_timings()?;
+    let unfreeze = vset.utime_since.saturating_add(timings.stake_held_for) as u64;
+    if (snapshot_utime as u64) >= unfreeze {
+        return Ok(()); // already released on the old chain
+    }
+    let start = time_ms / 1000;
+    anyhow::ensure!(
+        start < unfreeze,
+        "the new chain starts at {start}, after the previous validator set's stakes unfreeze \
+         ({unfreeze} = p34 utime_since {} + stake_held_for {}). Start earlier, or take the snapshot \
+         after that moment",
+        vset.utime_since,
+        timings.stake_held_for
+    );
+    println!(
+        "The previous validator set's stakes unfreeze at {unfreeze}: the new chain must be producing \
+         blocks within {}s of its start",
+        unfreeze - start
+    );
+    Ok(())
+}
+
+/// The new chain has to be able to run its first election, so it must start before that election
+/// closes; otherwise the supplied set expires with no successor and the chain stops.
+fn check_first_election_fits(new: &BlockchainConfigParams, time_ms: u64) -> Result<()> {
+    let vset = new
+        .get::<ConfigParam34>()?
+        .context("no current validator set (p34)")?;
+    let timings = new.get_election_timings()?;
+    let closes = vset.utime_until.saturating_sub(timings.elections_end_before) as u64;
+    let start = time_ms / 1000;
+    anyhow::ensure!(
+        start < closes,
+        "the new chain starts at {start}, after its first election closes ({closes}); the validator \
+         set would expire with no successor"
+    );
     Ok(())
 }
 
@@ -721,6 +823,9 @@ fn update_config_account(
     Ok(())
 }
 
+// The original behaviour, kept for reference: it erased every election record and credit while the
+// tokens stayed in the elector, which made outstanding stakes unrecoverable.
+#[allow(dead_code)]
 fn reset_elector_account(account: &mut tycho::ShardAccount) -> Result<()> {
     static ELECTOR_ABI: OnceLock<AbiType> = OnceLock::new();
 
