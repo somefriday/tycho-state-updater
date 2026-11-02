@@ -296,11 +296,14 @@ fn override_validator_set(
         config.remove(37)?;
         config.set::<ConfigParam34>(vset)?;
 
-        // DePools require p32: keep old p32 when p34 continues unchanged;
+        // DePools require p32: keep old p32 when p34 continues the snapshot's round;
         // otherwise use old p34 as the previous set.
         let old_current = old_config.get::<ConfigParam34>()?;
         let prev = match old_current {
-            Some(old) if same_validator_set(&old, vset) => old_config.get::<ConfigParam32>()?,
+            Some(old) if same_round(&old, vset) => {
+                check_same_validator_set(old_config, config, &old, vset)?;
+                old_config.get::<ConfigParam32>()?
+            }
             other => other,
         };
         if let Some(prev) = prev {
@@ -311,16 +314,55 @@ fn override_validator_set(
     Ok(())
 }
 
-/// Same validators over the same period. Compares what identifies a set rather than the whole struct,
-/// because a set read from JSON and one read from a cell differ in derived fields.
-fn same_validator_set(a: &tycho::ValidatorSet, b: &tycho::ValidatorSet) -> bool {
-    a.utime_since == b.utime_since
-        && a.utime_until == b.utime_until
-        && a.list.len() == b.list.len()
-        && a.list
-            .iter()
-            .zip(&b.list)
-            .all(|(x, y)| x.public_key == y.public_key && x.weight == y.weight)
+/// The supplied set starts and ends when the snapshot's current set does.
+fn same_round(a: &tycho::ValidatorSet, b: &tycho::ValidatorSet) -> bool {
+    a.utime_since == b.utime_since && a.utime_until == b.utime_until
+}
+
+/// The elector recognises the current set by the hash of its p34 cell, so a set that continues the
+/// round must be byte-identical to the snapshot's p34, or the elector treats it as unknown.
+fn check_same_validator_set(
+    old_config: &BlockchainConfigParams,
+    new_config: &BlockchainConfigParams,
+    old: &tycho::ValidatorSet,
+    new: &tycho::ValidatorSet,
+) -> Result<()> {
+    let old_cell = old_config.get_raw_cell(34)?.context("the old state has no p34")?;
+    let new_cell = new_config.get_raw_cell(34)?.context("the new config has no p34")?;
+    anyhow::ensure!(
+        old_cell.repr_hash() == new_cell.repr_hash(),
+        "the supplied validator set has the snapshot's utime_since and utime_until but differs from \
+         its p34: {}. Supply the snapshot's p34 verbatim; a different set needs its own times",
+        validator_set_difference(old, new)
+    );
+    Ok(())
+}
+
+/// Names the first field in which two validator sets differ, for the error message.
+fn validator_set_difference(old: &tycho::ValidatorSet, new: &tycho::ValidatorSet) -> String {
+    if old.list.len() != new.list.len() {
+        return format!("{} validators instead of {}", new.list.len(), old.list.len());
+    }
+    let adnl = |addr: Option<HashBytes>| addr.map_or("none".to_owned(), |addr| addr.to_string());
+    for (i, (a, b)) in old.list.iter().zip(&new.list).enumerate() {
+        if a.public_key != b.public_key {
+            return format!("validator #{i} has a different key (wrong key or order)");
+        }
+        if a.weight != b.weight {
+            return format!("validator #{i} has weight {} instead of {}", b.weight, a.weight);
+        }
+        if a.adnl_addr != b.adnl_addr {
+            return format!(
+                "validator #{i} has ADNL address {} instead of {}",
+                adnl(b.adnl_addr),
+                adnl(a.adnl_addr)
+            );
+        }
+    }
+    if old.main != new.main {
+        return format!("main is {} instead of {}", new.main, old.main);
+    }
+    "the records are encoded differently".to_owned()
 }
 
 /// Require a snapshot before elections open and without a pending p36 set.
