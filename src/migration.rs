@@ -103,6 +103,8 @@ pub fn migrate_state(
                         .checked_add(&total_balance.other)
                         .context("Failed to add extra currency")?,
                 };
+                // Pending masterchain validator fees are part of the supply until Tycho pays them out.
+                let global_balance = global_balance.checked_add(&old_state.total_validator_fees)?;
 
                 println!("Mapping masterchain extra...");
                 let custom = map_mc_state_extra(
@@ -457,7 +459,6 @@ fn prepare_hardfork_state(
         state.seqno,
         state.gen_utime,
         state.gen_utime as u64 * 1000 + state.gen_utime_ms as u64,
-        &state.total_balance,
         shardstate_id,
     )?;
     state.custom = Some(Lazy::new(&custom)?);
@@ -566,7 +567,6 @@ fn prepare_hardfork_mc_state_extra(
     mc_seqno: u32,
     gen_utime: u32,
     genesis_millis: u64,
-    total_balance: &tycho::CurrencyCollection,
     shard_state_hashes: Option<ZerostateId>,
 ) -> Result<()> {
     let mut shards = Vec::new();
@@ -617,7 +617,6 @@ fn prepare_hardfork_mc_state_extra(
     custom.after_key_block = true;
     custom.last_key_block = None;
     custom.block_create_stats = None;
-    custom.global_balance = total_balance.clone();
 
     Ok(())
 }
